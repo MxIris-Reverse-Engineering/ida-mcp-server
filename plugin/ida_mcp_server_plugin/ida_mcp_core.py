@@ -11,7 +11,15 @@ import json
 import traceback
 import functools
 import queue
-from typing import Any, Callable, TypeVar, Optional, Dict, List, Union, Tuple, Type
+import re
+import sys
+import io
+import builtins
+import threading
+import time
+import resource
+import platform
+from typing import Any, Callable, TypeVar, Optional, Dict, List, Union, Tuple, Type, Set
 
 # Type variable for function return type
 T = TypeVar('T')
@@ -428,48 +436,6 @@ class IDAMCPCore:
             traceback.print_exc()
             return {"success": False, "message": str(e)}
     
-    @idawrite
-    def add_assembly_comment(self, address: str, comment: str, is_repeatable: bool) -> Dict[str, Any]:
-        """Add an assembly comment"""
-        return self._add_assembly_comment_internal(address, comment, is_repeatable)
-        
-    def _add_assembly_comment_internal(self, address: str, comment: str, is_repeatable: bool) -> Dict[str, Any]:
-        """Internal implementation for add_assembly_comment without sync wrapper"""
-        try:
-            # Convert address string to integer
-            addr: int
-            if isinstance(address, str):
-                if address.startswith("0x"):
-                    addr = int(address, 16)
-                else:
-                    try:
-                        addr = int(address, 16)  # Try parsing as hex
-                    except ValueError:
-                        try:
-                            addr = int(address)  # Try parsing as decimal
-                        except ValueError:
-                            return {"success": False, "message": f"Invalid address format: {address}"}
-            else:
-                addr = address
-            
-            # Check if address is valid
-            if addr == idaapi.BADADDR or not ida_bytes.is_loaded(addr):
-                return {"success": False, "message": f"Invalid or unloaded address: {hex(addr)}"}
-            
-            # Add comment
-            result: bool = idc.set_cmt(addr, comment, is_repeatable)
-            if result:
-                # Refresh view
-                self._refresh_view_internal()
-                comment_type: str = "repeatable" if is_repeatable else "regular"
-                return {"success": True, "message": f"Added {comment_type} assembly comment at address {hex(addr)}"}
-            else:
-                return {"success": False, "message": f"Failed to add assembly comment at address {hex(addr)}"}
-        
-        except Exception as e:
-            print(f"Error adding assembly comment: {str(e)}")
-            traceback.print_exc()
-            return {"success": False, "message": str(e)}
     
     @idawrite
     def rename_local_variable(self, function_name: str, old_name: str, new_name: str) -> Dict[str, Any]:
@@ -538,6 +504,50 @@ class IDAMCPCore:
         
         except Exception as e:
             print(f"Error renaming local variable: {str(e)}")
+            traceback.print_exc()
+            return {"success": False, "message": str(e)}
+    
+    
+    @idawrite
+    def add_assembly_comment(self, address: str, comment: str, is_repeatable: bool) -> Dict[str, Any]:
+        """Add an assembly comment"""
+        return self._add_assembly_comment_internal(address, comment, is_repeatable)
+        
+    def _add_assembly_comment_internal(self, address: str, comment: str, is_repeatable: bool) -> Dict[str, Any]:
+        """Internal implementation for add_assembly_comment without sync wrapper"""
+        try:
+            # Convert address string to integer
+            addr: int
+            if isinstance(address, str):
+                if address.startswith("0x"):
+                    addr = int(address, 16)
+                else:
+                    try:
+                        addr = int(address, 16)  # Try parsing as hex
+                    except ValueError:
+                        try:
+                            addr = int(address)  # Try parsing as decimal
+                        except ValueError:
+                            return {"success": False, "message": f"Invalid address format: {address}"}
+            else:
+                addr = address
+            
+            # Check if address is valid
+            if addr == idaapi.BADADDR or not ida_bytes.is_loaded(addr):
+                return {"success": False, "message": f"Invalid or unloaded address: {hex(addr)}"}
+            
+            # Add comment
+            result: bool = idc.set_cmt(addr, comment, is_repeatable)
+            if result:
+                # Refresh view
+                self._refresh_view_internal()
+                comment_type: str = "repeatable" if is_repeatable else "regular"
+                return {"success": True, "message": f"Added {comment_type} assembly comment at address {hex(addr)}"}
+            else:
+                return {"success": False, "message": f"Failed to add assembly comment at address {hex(addr)}"}
+        
+        except Exception as e:
+            print(f"Error adding assembly comment: {str(e)}")
             traceback.print_exc()
             return {"success": False, "message": str(e)}
     
@@ -849,25 +859,24 @@ class IDAMCPCore:
                     "stderr": "",
                     "traceback": ""
                 }
+            
+            # Run script through safety check first
+            is_safe, safety_message = ScriptSandbox.check_code_safety(script)
+            if not is_safe:
+                print(f"Script safety check failed: {safety_message}")
+                return {
+                    "success": False,
+                    "error": f"Script safety check failed: {safety_message}",
+                    "stdout": "",
+                    "stderr": f"Security violation: {safety_message}",
+                    "traceback": ""
+                }
                 
-            # Create a local namespace for script execution
-            script_globals = {
-                '__builtins__': __builtins__,
-                'idaapi': idaapi,
-                'idautils': idautils,
-                'idc': idc,
-                'ida_funcs': ida_funcs,
-                'ida_bytes': ida_bytes,
-                'ida_name': ida_name,
-                'ida_segment': ida_segment,
-                'ida_lines': ida_lines,
-                'ida_hexrays': ida_hexrays
-            }
+            # Create a sandboxed namespace for script execution
+            script_globals = ScriptSandbox.create_safe_globals()
             script_locals = {}
 
             # Save original stdin/stdout/stderr
-            import sys
-            import io
             original_stdout = sys.stdout
             original_stderr = sys.stderr
             original_stdin = sys.stdin
@@ -905,10 +914,61 @@ class IDAMCPCore:
                 if auto_handler_errors:
                     print(f"Auto-handler setup errors (not shown to user): {auto_handler_errors}")
 
-                # Execute the script
-                print("Executing script...")
-                exec(script, script_globals, script_locals)
-                print("Script execution completed")
+                # Execute the script in sandbox with timeout protection
+                print("Executing script in sandbox...")
+                
+                # Set script execution timeout (in seconds)
+                SCRIPT_TIMEOUT = 30
+                
+                # Flag to track script timeout
+                script_timed_out = False
+                
+                # Reset resource monitor
+                ResourceMonitor.reset()
+                
+                # Start resource monitoring thread
+                resource_thread = threading.Thread(target=ResourceMonitor.monitor_resources)
+                resource_thread.daemon = True
+                resource_thread.start()
+                
+                # Result container for thread
+                thread_result = {"error": None, "traceback": None}
+                
+                # Define function to execute script in a separate thread
+                def execute_script_thread():
+                    try:
+                        exec(script, script_globals, script_locals)
+                    except Exception as e:
+                        import traceback as tb_module
+                        thread_result["error"] = str(e)
+                        thread_result["traceback"] = tb_module.format_exc()
+                
+                # Create and start thread
+                script_thread = threading.Thread(target=execute_script_thread)
+                script_thread.daemon = True  # Allow thread to be killed when main thread exits
+                script_thread.start()
+                
+                # Wait for thread to complete with timeout
+                script_thread.join(SCRIPT_TIMEOUT)
+                
+                # Check if resource limits were exceeded
+                if ResourceMonitor.resource_exceeded:
+                    script_timed_out = True
+                    stderr_capture.write(f"\n{ResourceMonitor.error_message}")
+                    print(f"Resource limit exceeded: {ResourceMonitor.error_message}")
+                # Check if thread is still running (timeout occurred)
+                elif script_thread.is_alive():
+                    script_timed_out = True
+                    stderr_capture.write(f"\nScript execution timed out after {SCRIPT_TIMEOUT} seconds. This could be due to an infinite loop or a very long-running operation.")
+                    print(f"Script execution timed out after {SCRIPT_TIMEOUT} seconds")
+                    # Note: We can't forcibly terminate the thread in Python, but setting daemon=True
+                    # ensures it will be terminated when the main thread exits
+                else:
+                    print("Script execution completed")
+                
+                # If thread had an error, propagate it
+                if thread_result["error"]:
+                    raise Exception(thread_result["error"])
                 
                 # Get captured output
                 stdout = stdout_capture.getvalue()
@@ -951,12 +1011,20 @@ class IDAMCPCore:
                 result = {
                     "stdout": filtered_stdout.strip() if filtered_stdout else "",
                     "stderr": stderr.strip() if stderr else "",
-                    "success": True,
-                    "traceback": ""
+                    "success": not script_timed_out,
+                    "traceback": "",
+                    "timed_out": script_timed_out
                 }
                 
-                # Check for return value
-                if "result" in script_locals:
+                # Add timeout/resource information if script timed out
+                if script_timed_out:
+                    if ResourceMonitor.resource_exceeded:
+                        result["error"] = ResourceMonitor.error_message
+                    else:
+                        result["error"] = f"Script execution timed out after {SCRIPT_TIMEOUT} seconds"
+                
+                # Check for return value (only if script didn't time out)
+                if not script_timed_out and "result" in script_locals:
                     try:
                         print(f"Script returned value of type: {type(script_locals['result']).__name__}")
                         result["return_value"] = str(script_locals["result"])
@@ -968,9 +1036,9 @@ class IDAMCPCore:
                 print(f"Returning script result with keys: {', '.join(result.keys())}")
                 return result
             except Exception as e:
-                import traceback
+                import traceback as tb_module
                 error_msg = str(e)
-                tb = traceback.format_exc()
+                tb = tb_module.format_exc()
                 print(f"Script execution error: {error_msg}")
                 print(tb)
                 return {
@@ -1215,3 +1283,346 @@ class IDAMCPCore:
         except Exception as e:
             print(f"Error restoring original handlers: {str(e)}")
             traceback.print_exc() 
+
+class ScriptSandbox:
+    """
+    Implements a sandbox environment for safely executing user scripts.
+    Restricts access to potentially dangerous operations and modules.
+    """
+    
+    # List of allowed modules that can be imported in the sandbox
+    ALLOWED_MODULES = {
+        # IDA related modules
+        'idaapi', 'idautils', 'idc', 'ida_funcs', 'ida_bytes', 
+        'ida_name', 'ida_segment', 'ida_lines', 'ida_hexrays',
+        # Basic standard library modules
+        'math', 'random', 're', 'datetime', 'time', 'json',
+        'collections', 'itertools', 'functools', 'struct',
+        # Other safe modules
+        'base64', 'hashlib', 'uuid'
+    }
+    
+    # List of specifically disallowed built-in functions
+    DISALLOWED_BUILTINS = {
+        'exec', 'eval', 'compile', '__import__', 
+        'open', 'file', 'input',
+        'globals', 'locals', 'vars',
+        'memoryview', 'breakpoint',
+        'getattr', 'setattr', 'delattr', 'hasattr'
+    }
+    
+    # Regular expressions for detecting potentially malicious code
+    DANGEROUS_PATTERNS = [
+        # Accessing dangerous dunder methods
+        r'__(?:class)?getattribute__',
+        r'__(?:base)?subclasses__',
+        r'__loader__',
+        r'__subclasses__\(\)',
+        r'__mro__',
+        r'__weakref__',
+        
+        # System access modules
+        r'subprocess\..*',
+        r'os\..*',
+        r'sys\..*',
+        r'socket\..*',
+        r'importlib\..*',
+        r'shutil\..*',
+        r'io\..*',
+        r'glob\..*',
+        r'tempfile\..*',
+        r'pathlib\..*',
+        
+        # Serialization (potential for code execution)
+        r'pickle\..*',
+        r'marshal\..*',
+        r'shelve\..*',
+        r'dill\..*',
+        
+        # Native code/system interaction
+        r'ctypes\..*',
+        r'pty\..*',
+        r'platform\..*',
+        r'multiprocessing\..*',
+        r'mmap\..*',
+        r'commands\..*',
+        r'winreg\..*',
+        r'msvcrt\..*',
+        r'code\..*',
+        
+        # Network access
+        r'urllib\..*',
+        r'http\..*',
+        r'ftplib\..*',
+        r'ssl\..*',
+        r'requests\..*',
+        r'xmlrpc\..*',
+        r'smtplib\..*',
+        
+        # File operations
+        r'fileinput\..*',
+        r'anydbm\..*',
+        r'dbm\..*',
+        r'zipfile\..*',
+        r'tarfile\..*',
+        
+        # Specific dangerous functions
+        r'exec\(',
+        r'eval\(',
+        r'compile\(',
+        r'__import__\(',
+        r'open\(',
+        r'(?<!\.)\s*input\(',
+        r'globals\(\)',
+        r'locals\(\)',
+        r'getattr\(',
+        r'setattr\(',
+        r'delattr\(',
+        r'hasattr\(',
+        
+        # Special accessor methods
+        r'.__dict__',
+        r'.__class__',
+        r'.__globals__',
+        r'.__getattribute__',
+        r'.__setattr__',
+        r'.__delattr__',
+    ]
+    
+    @classmethod
+    def create_safe_globals(cls) -> Dict[str, Any]:
+        """
+        Create a restricted globals dictionary for sandbox execution.
+        
+        Returns:
+            A dictionary with restricted built-ins and allowed modules
+        """
+        # Start with a fresh built-ins dict - safer than modifying the existing one
+        safe_builtins = cls._create_safe_builtins()
+        
+        # Create a sandbox globals dictionary
+        sandbox_globals = {
+            '__builtins__': safe_builtins,
+            # Add allowed IDA modules
+            'idaapi': idaapi,
+            'idautils': idautils,
+            'idc': idc,
+            'ida_funcs': ida_funcs,
+            'ida_bytes': ida_bytes,
+            'ida_name': ida_name,
+            'ida_segment': ida_segment,
+            'ida_lines': ida_lines,
+            'ida_hexrays': ida_hexrays
+        }
+        
+        return sandbox_globals
+    
+    @classmethod
+    def _create_safe_builtins(cls) -> Dict[str, Any]:
+        """
+        Create a restricted builtins dictionary, removing dangerous functions.
+        
+        Returns:
+            A dictionary with safe built-in functions
+        """
+        # Create a copy of the built-ins
+        safe_builtins = dict(builtins.__dict__)
+        
+        # Remove disallowed built-ins
+        for func_name in cls.DISALLOWED_BUILTINS:
+            if func_name in safe_builtins:
+                del safe_builtins[func_name]
+        
+        # Create a safe limited import function
+        safe_builtins['__import__'] = cls._create_restricted_import()
+        
+        return safe_builtins
+    
+    @classmethod
+    def _create_restricted_import(cls) -> Callable:
+        """
+        Create a restricted import function that only allows specific modules.
+        
+        Returns:
+            A wrapper function for __import__ that only allows safe modules
+        """
+        original_import = builtins.__import__
+        
+        def restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
+            # Check if the module is in the allowed list
+            module_base = name.split('.')[0]
+            if module_base not in cls.ALLOWED_MODULES:
+                raise ImportError(f"Import of '{name}' is not allowed in the sandbox environment")
+            return original_import(name, globals, locals, fromlist, level)
+        
+        return restricted_import
+    
+    @classmethod
+    def check_code_safety(cls, script: str) -> Tuple[bool, str]:
+        """
+        Check if the script contains potentially dangerous code patterns.
+        
+        Args:
+            script: The script code to check
+            
+        Returns:
+            Tuple of (is_safe, message) - is_safe is True if no dangerous patterns found
+        """
+        # Make import pattern more comprehensive
+        import_pattern = r'^\s*(?:from|import)\s+([a-zA-Z0-9_\.]+)'
+        
+        # Check for imports of unauthorized modules
+        for line in script.splitlines():
+            match = re.match(import_pattern, line)
+            if match:
+                module_name = match.group(1).split('.')[0]
+                if module_name not in cls.ALLOWED_MODULES:
+                    return False, f"Import of unauthorized module: {module_name}"
+        
+        # Check for dangerous patterns
+        for pattern in cls.DANGEROUS_PATTERNS:
+            if re.search(pattern, script):
+                return False, f"Dangerous code pattern detected: {pattern}"
+        
+        # Additional checks for direct attribute access
+        attribute_patterns = [
+            r'__dict__',
+            r'__globals__',
+            r'__code__',
+            r'__func__',
+            r'__builtins__'
+        ]
+        
+        for pattern in attribute_patterns:
+            if re.search(pattern, script):
+                return False, f"Dangerous attribute access detected: {pattern}"
+        
+        # Check for timeout evasion techniques
+        timeout_evasion_patterns = [
+            # Threading/multiprocessing to bypass timeout
+            r'threading\.',
+            r'Thread\(',
+            r'multiprocessing\.',
+            r'Process\(',
+            r'Pool\(',
+            # Long sleeps
+            r'(?:time\.)?sleep\s*\(\s*[0-9]+[0-9.]*\s*\)',
+            # Signals
+            r'signal\.',
+            # Infinite loops patterns
+            r'while\s+True',
+            r'while\s+1',
+            r'while\s+not\s+False',
+            r'for\s+.*\s+in\s+(?:iter|range)\s*\(\s*(?:[0-9]+\s*,\s*)*\s*\)',  # Suspicious iteration constructs
+            # Anti-sandbox patterns
+            r'(?:gc|sys|atexit)\.(?:set|register|add)(?:trace|callback|hook)',
+        ]
+        
+        for pattern in timeout_evasion_patterns:
+            if re.search(pattern, script):
+                return False, f"Potential timeout evasion detected: {pattern}"
+        
+        # Check for IDA-specific dangerous actions
+        ida_dangerous_patterns = [
+            # Functions that could crash IDA or modify the database unexpectedly
+            r'ida_loader\.load_',
+            r'ida_idp\.set_',
+            r'ida_diskio\.',
+            r'ida_auto\.reanalyze',
+            # File operations
+            r'idc\.load',
+            r'idc\.save',
+            r'idc\.exec',
+            r'idc\.system',
+            r'idc\.qexit',
+            r'idaapi\.qexit',
+            # UI manipulation or automation
+            r'ida_kernwin\.process_ui_action',
+            r'ida_kernwin\.create_desktop',
+            r'ida_kernwin\.restore_desktop'
+        ]
+        
+        for pattern in ida_dangerous_patterns:
+            if re.search(pattern, script):
+                return False, f"Dangerous IDA operation detected: {pattern}"
+        
+        return True, "Script passed safety check"
+
+class ResourceMonitor:
+    """
+    Monitor and limit resource usage for scripts running in the sandbox.
+    """
+    
+    # Maximum allowed memory usage in bytes (default: 500MB)
+    MAX_MEMORY = 500 * 1024 * 1024
+    
+    # Resource consumption was above threshold
+    resource_exceeded = False
+    
+    # Error message if resources were exceeded
+    error_message = ""
+    
+    @classmethod
+    def reset(cls):
+        """Reset monitoring state"""
+        cls.resource_exceeded = False
+        cls.error_message = ""
+    
+    @classmethod
+    def check_memory_usage(cls) -> Tuple[bool, int]:
+        """
+        Check current memory usage.
+        
+        Returns:
+            Tuple of (is_within_limits, current_usage_bytes)
+        """
+        try:
+            if platform.system() == 'Windows':
+                # Windows-specific memory check using psutil if available
+                try:
+                    import psutil
+                    process = psutil.Process()
+                    memory_info = process.memory_info()
+                    memory_usage = memory_info.rss  # Resident Set Size in bytes
+                except ImportError:
+                    # Fallback if psutil is not available
+                    memory_usage = 0  # Can't check on Windows without psutil
+                    return (True, memory_usage)
+            else:
+                # Unix/Linux/macOS
+                rusage = resource.getrusage(resource.RUSAGE_SELF)
+                # maxrss is in kilobytes on Unix
+                memory_usage = rusage.ru_maxrss * 1024
+            
+            return (memory_usage <= cls.MAX_MEMORY, memory_usage)
+        except Exception as e:
+            print(f"Error checking memory usage: {str(e)}")
+            # On error, assume usage is within limits to avoid false positives
+            return (True, 0)
+    
+    @classmethod
+    def monitor_resources(cls, interval=1.0):
+        """
+        Periodically check resource usage and set flag if thresholds are exceeded.
+        
+        Args:
+            interval: Check interval in seconds
+        """
+        start_time = time.time()
+        try:
+            while True:
+                # Check memory usage
+                is_memory_ok, memory_usage = cls.check_memory_usage()
+                if not is_memory_ok:
+                    cls.resource_exceeded = True
+                    cls.error_message = f"Script exceeded memory limit of {cls.MAX_MEMORY / (1024*1024):.1f}MB (used {memory_usage / (1024*1024):.1f}MB)"
+                    break
+                
+                # Check if we've been running this monitoring thread too long
+                elapsed = time.time() - start_time
+                if elapsed > 60:  # 1 minute max for monitoring thread
+                    break
+                    
+                time.sleep(interval)
+        except Exception as e:
+            print(f"Error in resource monitor: {str(e)}")
