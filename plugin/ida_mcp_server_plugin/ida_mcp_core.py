@@ -21,6 +21,18 @@ import resource
 import platform
 from typing import Any, Callable, TypeVar, Optional, Dict, List, Union, Tuple, Type, Set
 
+# Attempt to import the ida_tool decorator
+try:
+    # This will be available when the plugin is loaded
+    from ida_mcp_server_plugin import get_ida_tool_decorator
+    ida_tool = get_ida_tool_decorator()
+except ImportError:
+    # Fallback for when the module is being loaded before the plugin
+    def ida_tool(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator if args and callable(args[0]) else decorator
+
 # Type variable for function return type
 T = TypeVar('T')
 
@@ -126,6 +138,55 @@ def idawrite(func: Callable[..., T]) -> Callable[..., T]:
 class IDAMCPCore:
     """Core functionality implementation class for IDA MCP"""
     
+    def __init__(self):
+        """Initialize core"""
+        pass
+    
+    @idaread
+    @ida_tool(description="获取当前二进制文件中的所有字符串")
+    def get_all_strings(self, max_count: int = 1000, min_length: int = 4) -> Dict[str, Any]:
+        """
+        获取当前二进制文件中的所有字符串
+        
+        Args:
+            max_count: 最大返回字符串数量
+            min_length: 最小字符串长度
+            
+        Returns:
+            包含所有字符串的结果字典
+        """
+        try:
+            strings = []
+            count = 0
+            
+            for s in idautils.Strings():
+                if count >= max_count:
+                    break
+                
+                if s and s.length >= min_length:
+                    string_value = str(s)
+                    address = s.ea
+                    
+                    strings.append({
+                        "address": hex(address),
+                        "value": string_value,
+                        "length": s.length
+                    })
+                    count += 1
+            
+            return {
+                "success": True,
+                "strings": strings,
+                "count": len(strings),
+                "formatted_response": f"找到 {len(strings)} 个字符串"
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"获取字符串时出错: {str(e)}",
+                "formatted_response": f"获取字符串失败: {str(e)}"
+            }
+
     @idaread
     def get_function_assembly_by_name(self, function_name: str) -> Dict[str, Any]:
         """Get assembly code for a function by its name"""
@@ -1283,6 +1344,64 @@ class IDAMCPCore:
         except Exception as e:
             print(f"Error restoring original handlers: {str(e)}")
             traceback.print_exc() 
+
+    @idaread
+    @ida_tool(description="获取函数的引用（被调用的位置）")
+    def get_function_references(self, function_name: str) -> Dict[str, Any]:
+        """
+        获取一个函数被调用的所有位置
+        
+        Args:
+            function_name: 函数名称
+            
+        Returns:
+            包含所有引用的结果字典
+        """
+        try:
+            # 获取函数地址
+            function_addr = idaapi.get_name_ea(idaapi.BADADDR, function_name)
+            if function_addr == idaapi.BADADDR:
+                return {
+                    "success": False,
+                    "error": f"找不到函数 '{function_name}'",
+                    "formatted_response": f"找不到函数 '{function_name}'"
+                }
+            
+            # 验证这是一个函数
+            func = idaapi.get_func(function_addr)
+            if not func:
+                return {
+                    "success": False,
+                    "error": f"'{function_name}' 不是一个有效的函数",
+                    "formatted_response": f"'{function_name}' 不是一个有效的函数"
+                }
+            
+            # 收集引用
+            references = []
+            for ref in idautils.XrefsTo(function_addr):
+                if ref.iscode:  # 只关注代码引用
+                    referring_func = idaapi.get_func(ref.frm)
+                    if referring_func:
+                        references.append({
+                            "address": hex(ref.frm),
+                            "function_name": idaapi.get_func_name(referring_func.start_ea),
+                            "function_address": hex(referring_func.start_ea)
+                        })
+            
+            return {
+                "success": True,
+                "function_name": function_name,
+                "function_address": hex(function_addr),
+                "references": references,
+                "count": len(references),
+                "formatted_response": f"找到 {len(references)} 个对函数 '{function_name}' 的引用"
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"获取函数引用时出错: {str(e)}",
+                "formatted_response": f"获取函数引用失败: {str(e)}"
+            }
 
 class ScriptSandbox:
     """

@@ -1,136 +1,54 @@
 # IDA MCP Server
 
-> [!NOTE]
-> The idalib mode is under development, and it will not require installing the IDA plugin or running IDA (idalib is available from IDA Pro 9.0+).
+IDA MCP (Machine Code Processor) Server是一个IDA Pro插件，提供与MCP客户端的集成，使外部工具能够通过API与IDA交互。
 
-## Overview
+## 特性
 
-A Model Context Protocol server for IDA interaction and automation. This server provides tools to read IDA database via Large Language Models.
+- 简单易用的API接口
+- 安全的网络通信
+- 支持远程函数调用
+- 自动类型转换和参数验证
+- 轻松扩展，添加新工具
 
-Please note that mcp-server-ida is currently in early development. The functionality and available tools are subject to change and expansion as we continue to develop and improve the server.
+## 最近改进
 
-## Installation
+- **装饰器系统**: 添加了`@ida_tool`装饰器，简化了新工具的添加
+- **自动工具注册**: 无需手动创建枚举或模型类，直接注解IDAMCPCore方法
+- **类型提示支持**: 使用Python类型提示自动验证和转换参数
+- **无样板代码**: 大大减少了添加新功能所需的代码量
 
-### Using uv (recommended)
+## 快速使用
 
-When using [`uv`](https://docs.astral.sh/uv/) no specific installation is needed. We will
-use [`uvx`](https://docs.astral.sh/uv/guides/tools/) to directly run *mcp-server-ida*.
+启动IDA Pro，然后通过Edit->Plugins->IDA MCP Server菜单或使用Ctrl-Alt-M快捷键启动服务器。
 
-### Using PIP
+## 为开发者添加新工具
 
-Alternatively you can install `mcp-server-ida` via pip:
+添加新工具现在非常简单：
 
-```
-pip install mcp-server-ida
-```
+1. 在`ida_mcp_core.py`文件中找到`IDAMCPCore`类
+2. 添加新方法，使用`@ida_tool`装饰器标记
+3. 确保使用适当的类型提示和文档
+4. 重启插件
 
-After installation, you can run it as a script using:
+示例：
 
-```
-python -m mcp_server_ida
-```
-
-### IDA-Side
-
-Copy `repository/plugin/ida_mcp_server_plugin.py` and `repository/plugin/ida_mcp_server_plugin` directory into IDAs plugin directory 
-
-Windows: `%APPDATA%\Hex-Rays\IDA Pro\plugins`
-
-Linux/macOS: `$HOME/.idapro/plugins` eg: `~/.idapro/plugins`
-
-[igors-tip-of-the-week-103-sharing-plugins-between-ida-installs](https://hex-rays.com/blog/igors-tip-of-the-week-103-sharing-plugins-between-ida-installs)
-
-## Configuration
-
-### Usage with Claude Desktop
-
-Add this to your `claude_desktop_config.json`:
-
-<details>
-<summary>Using uvx</summary>
-
-```json
-"mcpServers": {
-  "git": {
-    "command": "uvx",
-    "args": [
-        "mcp-server-ida"
-    ]
-  }
-}
-```
-</details>
-
-<details>
-<summary>Using pip installation</summary>
-
-```json
-"mcpServers": {
-  "git": {
-    "command": "python",
-    "args": [
-        "-m", 
-        "mcp_server_ida"
-    ]
-  }
-}
-```
-</details>
-
-## Debugging
-
-You can use the MCP inspector to debug the server. For uvx installations:
-
-```
-npx @modelcontextprotocol/inspector uvx mcp-server-ida
+```python
+@idaread
+@ida_tool(description="获取当前二进制文件中的所有字符串")
+def get_all_strings(self, max_count: int = 1000) -> Dict[str, Any]:
+    """获取当前二进制文件中的所有字符串"""
+    # 实现...
+    return {...}
 ```
 
-Or if you've installed the package in a specific directory or are developing on it:
+更多详细信息，请参阅[添加新工具的文档](docs/adding_new_tools.md)。
 
-```
-cd path/to/mcp-server-ida/src
-npx @modelcontextprotocol/inspector uv run mcp-server-ida
-```
+## 技术文档
 
-Running `tail -n 20 -f ~/Library/Logs/Claude/mcp*.log` will show the logs from the server and may
-help you debug any issues.
+- [添加新工具指南](docs/adding_new_tools.md)
+- [API参考文档](docs/api_reference.md)
+- [协议规范](docs/protocol.md)
 
-## Development
+## 许可证
 
-If you are doing local development, there are two ways to test your changes:
-
-1. Run the MCP inspector to test your changes. See [Debugging](#debugging) for run instructions.
-
-2. Test using the Claude desktop app. Add the following to your `claude_desktop_config.json`:
-
-### UVX
-```json
-{
-"mcpServers": {
-  "git": {
-    "command": "uv",
-    "args": [ 
-      "--directory",
-      "/<path to mcp-server-ida>",
-      "run",
-      "mcp-server-ida"
-    ]
-  }
-}
-```
-
-## Alternatives
-[ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)
-
-[ida-mcp-server-plugin](https://github.com/taida957789/ida-mcp-server-plugin)
-
-[mcp-server-idapro](https://github.com/fdrechsler/mcp-server-idapro)
-
-[pcm](https://github.com/rand-tech/pcm)
-
-
-## Screenshots
-
-![Screenshot 1](Screenshots/iShot_2025-03-15_19.04.06.png)
-![Screenshot 2](Screenshots/iShot_2025-03-15_18.54.53.png)
-![Screenshot 3](Screenshots/iShot_2025-03-15_19.06.27.png)
+[MIT](LICENSE)

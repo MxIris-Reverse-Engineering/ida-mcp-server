@@ -7,10 +7,11 @@ import traceback
 import time
 import sys
 import os
-from typing import Optional, Dict, Any, List, Tuple, Union, Set, Type, cast, Callable
+from typing import Optional, Dict, Any, List, Tuple, Union, Set, Type, cast, Callable, TypeVar, get_type_hints
 from ida_mcp_server_plugin.ida_mcp_core import IDAMCPCore
 from pydantic import BaseModel
 from enum import Enum
+import functools
 
 PLUGIN_NAME = "IDA MCP Server"
 PLUGIN_HOTKEY = "Ctrl-Alt-M"
@@ -20,6 +21,97 @@ PLUGIN_AUTHOR = "IDA MCP"
 # Default configuration
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 5000
+
+# -------------------------------------------------------------------
+# Tool Registry System
+# -------------------------------------------------------------------
+
+# Dictionary to store registered tool functions
+_tool_registry: Dict[str, Callable] = {}
+_tool_metadata: Dict[str, Dict[str, Any]] = {}
+T = TypeVar('T')
+
+def ida_tool(tool_name: Optional[str] = None, description: Optional[str] = None):
+    """
+    Decorator to register a function as an IDA tool
+    
+    Args:
+        tool_name: The name of the tool (defaults to function name prefixed with 'ida_')
+        description: A description of the tool
+    
+    This decorator can be used both for standalone functions and for methods in IDAMCPCore.
+    """
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        nonlocal tool_name, description
+        
+        # Get function name, handle methods with 'self' parameter
+        func_name = func.__name__
+        
+        # Default tool name is function name with ida_ prefix
+        if tool_name is None:
+            tool_name = f"ida_{func_name}"
+            
+        # Default description based on docstring or function name
+        if description is None:
+            description = func.__doc__ or f"IDA Pro tool: {func_name.replace('_', ' ')}"
+        
+        # Store information about the function itself for direct registration
+        _tool_metadata[tool_name] = {
+            "name": tool_name,
+            "description": description,
+            "function": func,
+            "core_method": func_name,  # The actual method name in IDAMCPCore
+        }
+        
+        # For standalone functions, register directly
+        # For core methods, this will be overwritten at runtime
+        _tool_registry[tool_name] = func
+        
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            return func(*args, **kwargs)
+            
+        return wrapper
+    
+    return decorator
+
+# Export the ida_tool decorator for use in ida_mcp_core.py
+# This avoids circular imports
+def get_ida_tool_decorator():
+    return ida_tool
+
+# Function to automatically scan and register core methods
+def register_core_tools(core: IDAMCPCore) -> None:
+    """
+    Scans IDAMCPCore instance and registers all methods decorated with @ida_tool
+    
+    Args:
+        core: The IDAMCPCore instance
+    """
+    core_methods = dir(core)
+    
+    for tool_name, metadata in list(_tool_metadata.items()):
+        method_name = metadata.get("core_method")
+        
+        # If this is a core method and it exists in the core instance
+        if method_name and method_name in core_methods:
+            # Create a wrapper function that will call the core method
+            def create_wrapper(method_name):
+                def wrapper(**kwargs):
+                    # Get the method from the core instance
+                    method = getattr(core, method_name)
+                    # Call it with the given parameters
+                    return method(**kwargs)
+                return wrapper
+            
+            # Register the wrapper function
+            wrapper = create_wrapper(method_name)
+            wrapper.__name__ = method_name
+            wrapper.__doc__ = metadata.get("description")
+            
+            # Replace the original registration with the wrapper
+            _tool_registry[tool_name] = wrapper
+            log_info(f"Registered core method {method_name} as tool {tool_name}")
 
 # -------------------------------------------------------------------
 # Tool Request Models
@@ -229,499 +321,146 @@ class ResponseFormatter:
         }
 
 # -------------------------------------------------------------------
-# Service Registry for Tool Categorization and Management
+# Tool Executor
 # -------------------------------------------------------------------
 
-# Service registry for tool categorization and management
-class ServiceRegistry:
-    """Registry for MCP services"""
-    
-    class Service:
-        """Base class for MCP services"""
-        
-        def __init__(self, name: str, description: str, core: IDAMCPCore):
-            self.name = name
-            self.description = description
-            self.core = core
-            
-        def get_tools(self) -> List[str]:
-            """Get list of tool names supported by this service"""
-            return []
-            
-        def handles_tool(self, tool_name: str) -> bool:
-            """Check if this service handles the given tool"""
-            return tool_name in self.get_tools()
-            
-        def execute_tool(self, tool_name: str, data: Dict[str, Any]) -> Dict[str, Any]:
-            """Execute the given tool with the given data"""
-            return ResponseFormatter.format_error_response(f"Tool '{tool_name}' not implemented in service '{self.name}'")
-    
-    class AssemblyService(Service):
-        """Service for assembly-related tools"""
-        
-        def __init__(self, core: IDAMCPCore):
-            super().__init__("Assembly", "Assembly code viewing and analysis", core)
-            
-        def get_tools(self) -> List[str]:
-            return [
-                "get_function_assembly_by_name",
-                "get_function_assembly_by_address",
-                "get_current_function_assembly"
-            ]
-            
-        def execute_tool(self, tool_name: str, data: Dict[str, Any]) -> Dict[str, Any]:
-            if tool_name == "get_function_assembly_by_name":
-                function_name = data.get("function_name", "")
-                if not function_name:
-                    return ResponseFormatter.format_error_response("Function name not provided")
-                
-                result = self.core.get_function_assembly_by_name(function_name)
-                
-                if "error" in result:
-                    return ResponseFormatter.format_error_response(result["error"])
-                return ResponseFormatter.format_assembly_response(function_name, result.get("assembly", ""))
-                
-            elif tool_name == "get_function_assembly_by_address":
-                address = data.get("address", "")
-                if not address:
-                    return ResponseFormatter.format_error_response("Address not provided")
-                
-                # Convert string address to int
-                try:
-                    addr_int = int(address, 16) if isinstance(address, str) and address.startswith("0x") else int(address)
-                except ValueError:
-                    return ResponseFormatter.format_error_response(f"Invalid address format '{address}', expected hexadecimal (0x...) or decimal")
-                
-                result = self.core.get_function_assembly_by_address(addr_int)
-                
-                if "error" in result:
-                    return ResponseFormatter.format_error_response(result["error"])
-                return ResponseFormatter.format_assembly_response(result.get("function_name", "Unknown"), result.get("assembly", ""))
-                
-            elif tool_name == "get_current_function_assembly":
-                result = self.core.get_current_function_assembly()
-                
-                if "error" in result:
-                    return ResponseFormatter.format_error_response(result["error"])
-                return ResponseFormatter.format_assembly_response(result.get("function_name", "Current function"), result.get("assembly", ""))
-                
-            return super().execute_tool(tool_name, data)
-    
-    class DecompilerService(Service):
-        """Service for decompiler-related tools"""
-        
-        def __init__(self, core: IDAMCPCore):
-            super().__init__("Decompiler", "Decompiled code viewing and analysis", core)
-            
-        def get_tools(self) -> List[str]:
-            return [
-                "get_function_decompiled_by_name",
-                "get_function_decompiled_by_address",
-                "get_current_function_decompiled"
-            ]
-            
-        def execute_tool(self, tool_name: str, data: Dict[str, Any]) -> Dict[str, Any]:
-            if tool_name == "get_function_decompiled_by_name":
-                function_name = data.get("function_name", "")
-                if not function_name:
-                    return ResponseFormatter.format_error_response("Function name not provided")
-                
-                result = self.core.get_function_decompiled_by_name(function_name)
-                
-                if "error" in result:
-                    return ResponseFormatter.format_error_response(result["error"])
-                return ResponseFormatter.format_decompiled_response(function_name, result.get("decompiled_code", ""))
-                
-            elif tool_name == "get_function_decompiled_by_address":
-                address = data.get("address", "")
-                if not address:
-                    return ResponseFormatter.format_error_response("Address not provided")
-                
-                # Convert string address to int
-                try:
-                    addr_int = int(address, 16) if isinstance(address, str) and address.startswith("0x") else int(address)
-                except ValueError:
-                    return ResponseFormatter.format_error_response(f"Invalid address format '{address}', expected hexadecimal (0x...) or decimal")
-                
-                result = self.core.get_function_decompiled_by_address(addr_int)
-                
-                if "error" in result:
-                    return ResponseFormatter.format_error_response(result["error"])
-                return ResponseFormatter.format_decompiled_response(result.get("function_name", "Unknown"), result.get("decompiled_code", ""))
-                
-            elif tool_name == "get_current_function_decompiled":
-                result = self.core.get_current_function_decompiled()
-                
-                if "error" in result:
-                    return ResponseFormatter.format_error_response(result["error"])
-                return ResponseFormatter.format_decompiled_response(result.get("function_name", "Current function"), result.get("decompiled_code", ""))
-                
-            return super().execute_tool(tool_name, data)
-    
-    class VariablesService(Service):
-        """Service for variable-related tools"""
-        
-        def __init__(self, core: IDAMCPCore):
-            super().__init__("Variables", "Variable management and analysis", core)
-            
-        def get_tools(self) -> List[str]:
-            return [
-                "get_global_variable_by_name",
-                "get_global_variable_by_address",
-                "rename_local_variable",
-                "rename_global_variable",
-                "rename_multi_local_variables",
-                "rename_multi_global_variables"
-            ]
-            
-        def execute_tool(self, tool_name: str, data: Dict[str, Any]) -> Dict[str, Any]:
-            if tool_name == "get_global_variable_by_name":
-                variable_name = data.get("variable_name", "")
-                if not variable_name:
-                    return ResponseFormatter.format_error_response("Variable name not provided")
-                
-                result = self.core.get_global_variable_by_name(variable_name)
-                
-                if "error" in result:
-                    return ResponseFormatter.format_error_response(result["error"])
-                return ResponseFormatter.format_variable_info_response(result.get("variable_info", ""))
-                
-            elif tool_name == "get_global_variable_by_address":
-                address = data.get("address", "")
-                if not address:
-                    return ResponseFormatter.format_error_response("Address not provided")
-                
-                # Convert string address to int
-                try:
-                    addr_int = int(address, 16) if isinstance(address, str) and address.startswith("0x") else int(address)
-                except ValueError:
-                    return ResponseFormatter.format_error_response(f"Invalid address format '{address}', expected hexadecimal (0x...) or decimal")
-                
-                result = self.core.get_global_variable_by_address(addr_int)
-                
-                if "error" in result:
-                    return ResponseFormatter.format_error_response(result["error"])
-                return ResponseFormatter.format_variable_info_response(result.get("variable_info", ""))
-                
-            elif tool_name == "rename_local_variable":
-                function_name = data.get("function_name", "")
-                old_name = data.get("old_name", "")
-                new_name = data.get("new_name", "")
-                
-                if not function_name:
-                    return ResponseFormatter.format_error_response("Function name not provided")
-                if not old_name:
-                    return ResponseFormatter.format_error_response("Old variable name not provided")
-                if not new_name:
-                    return ResponseFormatter.format_error_response("New variable name not provided")
-                
-                result = self.core.rename_local_variable(function_name, old_name, new_name)
-                
-                return ResponseFormatter.format_rename_response(
-                    result.get("success", False),
-                    result.get("message", ""),
-                    tool_name
-                )
-                
-            elif tool_name == "rename_global_variable":
-                old_name = data.get("old_name", "")
-                new_name = data.get("new_name", "")
-                
-                if not old_name:
-                    return ResponseFormatter.format_error_response("Old variable name not provided")
-                if not new_name:
-                    return ResponseFormatter.format_error_response("New variable name not provided")
-                
-                result = self.core.rename_global_variable(old_name, new_name)
-                
-                return ResponseFormatter.format_rename_response(
-                    result.get("success", False),
-                    result.get("message", ""),
-                    tool_name
-                )
-                
-            elif tool_name == "rename_multi_local_variables":
-                function_name = data.get("function_name", "")
-                rename_pairs = data.get("rename_pairs_old2new", [])
-                
-                if not function_name:
-                    return ResponseFormatter.format_error_response("Function name not provided")
-                if not rename_pairs or not isinstance(rename_pairs, list):
-                    return ResponseFormatter.format_error_response("Rename pairs not provided or invalid format")
-                
-                result = self.core.rename_multi_local_variables(function_name, rename_pairs)
-                
-                return ResponseFormatter.format_rename_response(
-                    result.get("success", False),
-                    result.get("message", ""),
-                    tool_name
-                )
-                
-            elif tool_name == "rename_multi_global_variables":
-                rename_pairs = data.get("rename_pairs_old2new", [])
-                
-                if not rename_pairs or not isinstance(rename_pairs, list):
-                    return ResponseFormatter.format_error_response("Rename pairs not provided or invalid format")
-                
-                result = self.core.rename_multi_global_variables(rename_pairs)
-                
-                return ResponseFormatter.format_rename_response(
-                    result.get("success", False),
-                    result.get("message", ""),
-                    tool_name
-                )
-                
-            return super().execute_tool(tool_name, data)
-    
-    class FunctionsService(Service):
-        """Service for function-related tools"""
-        
-        def __init__(self, core: IDAMCPCore):
-            super().__init__("Functions", "Function management and analysis", core)
-            
-        def get_tools(self) -> List[str]:
-            return [
-                "rename_function",
-                "rename_multi_functions"
-            ]
-            
-        def execute_tool(self, tool_name: str, data: Dict[str, Any]) -> Dict[str, Any]:
-            if tool_name == "rename_function":
-                old_name = data.get("old_name", "")
-                new_name = data.get("new_name", "")
-                
-                if not old_name:
-                    return ResponseFormatter.format_error_response("Old function name not provided")
-                if not new_name:
-                    return ResponseFormatter.format_error_response("New function name not provided")
-                
-                result = self.core.rename_function(old_name, new_name)
-                
-                return ResponseFormatter.format_rename_response(
-                    result.get("success", False),
-                    result.get("message", ""),
-                    tool_name
-                )
-                
-            elif tool_name == "rename_multi_functions":
-                rename_pairs = data.get("rename_pairs_old2new", [])
-                
-                if not rename_pairs or not isinstance(rename_pairs, list):
-                    return ResponseFormatter.format_error_response("Rename pairs not provided or invalid format")
-                
-                result = self.core.rename_multi_functions(rename_pairs)
-                
-                return ResponseFormatter.format_rename_response(
-                    result.get("success", False),
-                    result.get("message", ""),
-                    tool_name
-                )
-                
-            return super().execute_tool(tool_name, data)
-    
-    class CommentsService(Service):
-        """Service for comment-related tools"""
-        
-        def __init__(self, core: IDAMCPCore):
-            super().__init__("Comments", "Comments management", core)
-            
-        def get_tools(self) -> List[str]:
-            return [
-                "add_assembly_comment",
-                "add_function_comment",
-                "add_pseudocode_comment"
-            ]
-            
-        def execute_tool(self, tool_name: str, data: Dict[str, Any]) -> Dict[str, Any]:
-            if tool_name == "add_assembly_comment":
-                address = data.get("address", "")
-                comment = data.get("comment", "")
-                is_repeatable = data.get("is_repeatable", False)
-                
-                if not address:
-                    return ResponseFormatter.format_error_response("Address not provided")
-                if not comment:
-                    return ResponseFormatter.format_error_response("Comment not provided")
-                
-                result = self.core.add_assembly_comment(address, comment, is_repeatable)
-                
-                return ResponseFormatter.format_comment_response(
-                    result.get("success", False),
-                    result.get("message", ""),
-                    tool_name
-                )
-                
-            elif tool_name == "add_function_comment":
-                function_name = data.get("function_name", "")
-                comment = data.get("comment", "")
-                is_repeatable = data.get("is_repeatable", False)
-                
-                if not function_name:
-                    return ResponseFormatter.format_error_response("Function name not provided")
-                if not comment:
-                    return ResponseFormatter.format_error_response("Comment not provided")
-                
-                result = self.core.add_function_comment(function_name, comment, is_repeatable)
-                
-                return ResponseFormatter.format_comment_response(
-                    result.get("success", False),
-                    result.get("message", ""),
-                    tool_name
-                )
-                
-            elif tool_name == "add_pseudocode_comment":
-                function_name = data.get("function_name", "")
-                address = data.get("address", "")
-                comment = data.get("comment", "")
-                is_repeatable = data.get("is_repeatable", False)
-                
-                if not function_name:
-                    return ResponseFormatter.format_error_response("Function name not provided")
-                if not address:
-                    return ResponseFormatter.format_error_response("Address not provided")
-                if not comment:
-                    return ResponseFormatter.format_error_response("Comment not provided")
-                
-                result = self.core.add_pseudocode_comment(function_name, address, comment, is_repeatable)
-                
-                return ResponseFormatter.format_comment_response(
-                    result.get("success", False),
-                    result.get("message", ""),
-                    tool_name
-                )
-                
-            return super().execute_tool(tool_name, data)
-    
-    class ScriptingService(Service):
-        """Service for scripting-related tools"""
-        
-        def __init__(self, core: IDAMCPCore):
-            super().__init__("Scripting", "Script execution", core)
-            
-        def get_tools(self) -> List[str]:
-            return [
-                "execute_script",
-                "execute_script_from_file"
-            ]
-            
-        def execute_tool(self, tool_name: str, data: Dict[str, Any]) -> Dict[str, Any]:
-            if tool_name == "execute_script":
-                script = data.get("script", "")
-                
-                if not script:
-                    return ResponseFormatter.format_error_response("Script not provided")
-                
-                result = self.core.execute_script(script)
-                
-                return ResponseFormatter.format_script_response(
-                    result.get("success", False),
-                    result.get("message", ""),
-                    result.get("stdout", ""),
-                    result.get("stderr", "")
-                )
-                
-            elif tool_name == "execute_script_from_file":
-                file_path = data.get("file_path", "")
-                
-                if not file_path:
-                    return ResponseFormatter.format_error_response("File path not provided")
-                
-                result = self.core.execute_script_from_file(file_path)
-                
-                return ResponseFormatter.format_script_response(
-                    result.get("success", False),
-                    result.get("message", ""),
-                    result.get("stdout", ""),
-                    result.get("stderr", "")
-                )
-                
-            return super().execute_tool(tool_name, data)
-    
-    class UIService(Service):
-        """Service for UI-related tools"""
-        
-        def __init__(self, core: IDAMCPCore):
-            super().__init__("UI", "User interface operations", core)
-            
-        def get_tools(self) -> List[str]:
-            return [
-                "refresh_view"
-            ]
-            
-        def execute_tool(self, tool_name: str, data: Dict[str, Any]) -> Dict[str, Any]:
-            if tool_name == "refresh_view":
-                result = self.core.refresh_view()
-                
-                return {
-                    "success": result.get("success", False),
-                    "message": result.get("message", "View refreshed")
-                }
-                
-            return super().execute_tool(tool_name, data)
-    
-    class SystemService(Service):
-        """Service for system-related tools"""
-        
-        def __init__(self, core: IDAMCPCore):
-            super().__init__("System", "System operations", core)
-            
-        def get_tools(self) -> List[str]:
-            return [
-                "ping"
-            ]
-            
-        def execute_tool(self, tool_name: str, data: Dict[str, Any]) -> Dict[str, Any]:
-            if tool_name == "ping":
-                return {
-                    "status": "pong",
-                    "success": True,
-                    "formatted_response": "IDA Plugin is active and responding"
-                }
-                
-            return super().execute_tool(tool_name, data)
+class ToolExecutor:
+    """Executes tools registered with @ida_tool decorator"""
     
     def __init__(self, core: IDAMCPCore):
-        """Initialize service registry with core"""
+        """Initialize tool executor with core"""
         self.core = core
-        self.services: List[ServiceRegistry.Service] = [
-            self.AssemblyService(core),
-            self.DecompilerService(core),
-            self.VariablesService(core),
-            self.FunctionsService(core),
-            self.CommentsService(core),
-            self.ScriptingService(core),
-            self.UIService(core),
-            self.SystemService(core)
-        ]
         
-    def find_service_for_tool(self, tool_name: str) -> Optional[Service]:
-        """Find service that handles the given tool"""
-        for service in self.services:
-            if service.handles_tool(tool_name):
-                return service
-        return None
-    
     def execute_tool(self, tool_name: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute a tool with the given data"""
-        service = self.find_service_for_tool(tool_name)
-        if service:
-            try:
-                log_info(f"Executing tool {tool_name} with service {service.name}")
-                return service.execute_tool(tool_name, data)
-            except Exception as e:
-                log_error(f"Error executing tool {tool_name}: {str(e)}")
-                traceback.print_exc()
-                return ResponseFormatter.format_error_response(f"Error executing {tool_name}: {str(e)}")
-        else:
-            log_warning(f"No service found for tool: {tool_name}")
-            return ResponseFormatter.format_error_response(f"No service found for tool: {tool_name}")
+        """Execute a registered tool with the given data"""
+        # Add ida_ prefix if not already present
+        full_tool_name = tool_name if tool_name.startswith("ida_") else f"ida_{tool_name}"
+        
+        # Get the base name without ida_ prefix for checking the registry
+        base_tool_name = tool_name.replace("ida_", "")
+        full_tool_name = f"ida_{base_tool_name}"
+        
+        try:
+            log_info(f"Executing tool {full_tool_name}")
+            
+            # Check if tool exists in registry
+            if full_tool_name in _tool_registry:
+                func = _tool_registry[full_tool_name]
+                
+                # Get the function's type hints
+                type_hints = get_type_hints(func)
+                
+                # Remove return annotation if present
+                type_hints.pop("return", None)
+                
+                # Convert and validate parameters
+                kwargs = {}
+                
+                # For each parameter in the function signature
+                for param_name, expected_type in type_hints.items():
+                    if param_name in data:
+                        value = data[param_name]
+                        # Try to convert to expected type if needed
+                        if not isinstance(value, expected_type) and expected_type != Any:
+                            try:
+                                # Handle special case for addresses
+                                if param_name == "address" and isinstance(value, str):
+                                    if value.startswith("0x"):
+                                        value = int(value, 16)
+                                    else:
+                                        value = int(value)
+                                else:
+                                    value = expected_type(value)
+                            except (ValueError, TypeError):
+                                return ResponseFormatter.format_error_response(
+                                    f"Invalid type for parameter '{param_name}': expected {expected_type.__name__}"
+                                )
+                        kwargs[param_name] = value
+                
+                # Call the function with the prepared parameters
+                result = func(**kwargs)
+                
+                # Ensure the result is a dict with at least success field
+                if not isinstance(result, dict):
+                    result = {"success": True, "result": result}
+                if "success" not in result:
+                    result["success"] = True
+                    
+                return result
+            else:
+                # Try to use core methods directly if no registered tool found
+                # This provides backward compatibility with the old system
+                method_name = base_tool_name
+                if hasattr(self.core, method_name) and callable(getattr(self.core, method_name)):
+                    method = getattr(self.core, method_name)
+                    result = method(**data)
+                    return result
+                
+                log_warning(f"No tool found for {full_tool_name}")
+                return ResponseFormatter.format_error_response(f"Tool not found: {full_tool_name}")
+                
+        except Exception as e:
+            log_error(f"Error executing tool {full_tool_name}: {str(e)}")
+            traceback.print_exc()
+            return ResponseFormatter.format_error_response(f"Error executing {full_tool_name}: {str(e)}")
     
-    def get_all_tools(self) -> List[str]:
-        """Get list of all tool names"""
+    def get_all_tools(self) -> List[Dict[str, Any]]:
+        """Get list of all registered tools with their metadata"""
         tools = []
-        for service in self.services:
-            tools.extend(service.get_tools())
+        
+        for tool_name, metadata in _tool_metadata.items():
+            function = metadata["function"]
+            
+            # Get parameter information from type hints
+            type_hints = get_type_hints(function)
+            type_hints.pop("return", None)  # Remove return annotation
+            
+            # Create schema for the tool
+            properties = {}
+            required = []
+            
+            for param_name, param_type in type_hints.items():
+                # Convert Python types to JSON schema types
+                json_type = "string"
+                if param_type == int:
+                    json_type = "integer"
+                elif param_type == float:
+                    json_type = "number"
+                elif param_type == bool:
+                    json_type = "boolean"
+                elif param_type == List[str]:
+                    json_type = "array"
+                
+                # Add parameter to properties
+                properties[param_name] = {
+                    "type": json_type,
+                    "description": f"Parameter: {param_name}"
+                }
+                
+                # Add to required list (we assume all parameters are required for now)
+                required.append(param_name)
+            
+            # Create input schema
+            input_schema = {
+                "type": "object",
+                "properties": properties,
+                "required": required
+            }
+            
+            # Create tool definition
+            tool_def = {
+                "name": tool_name,
+                "description": metadata["description"],
+                "inputSchema": input_schema
+            }
+            
+            tools.append(tool_def)
+        
         return tools
+        
+    def get_tool_names(self) -> List[str]:
+        """Get list of all registered tool names"""
+        return list(_tool_registry.keys())
 
 # -------------------------------------------------------------------
 # Socket Server for MCP Protocol Communication
@@ -730,14 +469,14 @@ class ServiceRegistry:
 class SocketServer:
     """Socket server for MCP protocol communication"""
     
-    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, service_registry: ServiceRegistry = None):
+    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, tool_executor: ToolExecutor = None):
         self.host: str = host
         self.port: int = port
         self.server_socket: Optional[socket.socket] = None
         self.running: bool = False
         self.thread: Optional[threading.Thread] = None
         self.client_counter: int = 0
-        self.service_registry = service_registry
+        self.tool_executor = tool_executor
         
         # Check environment variables for configuration
         if 'IDA_MCP_HOST' in os.environ:
@@ -997,10 +736,8 @@ class SocketServer:
                             if not tool_name:
                                 response["error"] = "Tool name not provided"
                             else:
-                                # Call the service registry to execute the tool
-                                # Strip the 'ida_' prefix if present
-                                internal_tool_name = tool_name.replace("ida_", "")
-                                result = self.service_registry.execute_tool(internal_tool_name, arguments)
+                                # Call the tool executor to execute the tool
+                                result = self.tool_executor.execute_tool(tool_name, arguments)
                                 response.update(result)
                         except Exception as e:
                             log_error(f"Error executing tool: {str(e)}")
@@ -1008,17 +745,17 @@ class SocketServer:
                             response["error"] = f"Error executing tool: {str(e)}"
                     
                     # For direct tool calls (backward compatibility)
-                    elif self.service_registry:
+                    elif self.tool_executor:
                         try:
-                            # Call the service registry to execute the tool
-                            result = self.service_registry.execute_tool(request_type, request_data)
+                            # Call the tool executor to execute the tool
+                            result = self.tool_executor.execute_tool(request_type, request_data)
                             response.update(result)
                         except Exception as e:
                             log_error(f"Error executing tool {request_type}: {str(e)}")
                             traceback.print_exc()
                             response["error"] = f"Error executing {request_type}: {str(e)}"
                     else:
-                        response["error"] = "Service registry not available"
+                        response["error"] = "Tool executor not available"
                     
                     # Ensure all values in response are serializable
                     self.sanitize_response(response)
@@ -1081,86 +818,14 @@ class SocketServer:
     def get_available_tool_list(self) -> List[Dict[str, Any]]:
         """Get list of available tools in the format needed by MCP"""
         try:
-            # 首先获取所有服务注册的工具名称
-            registered_tools = self.service_registry.get_all_tools() if self.service_registry else []
-            log_info(f"Service registry has {len(registered_tools)} registered tools")
+            if not self.tool_executor:
+                log_warning("No tool executor available")
+                return []
+                
+            # Get tools directly from the tool executor
+            tool_definitions = self.tool_executor.get_all_tools()
+            log_info(f"Returning {len(tool_definitions)} tools from tool executor")
             
-            # 创建工具定义列表
-            tool_definitions = []
-            
-            # 从IDATools枚举中获取所有可用工具
-            for tool_enum in IDATools:
-                # 检查工具是否注册
-                tool_name = tool_enum.value.replace("ida_", "")
-                if not registered_tools or tool_name in registered_tools:
-                    # 获取对应的模型类
-                    model_class = None
-                    if tool_enum == IDATools.GET_FUNCTION_ASSEMBLY_BY_NAME:
-                        model_class = GetFunctionAssemblyByName
-                    elif tool_enum == IDATools.GET_FUNCTION_ASSEMBLY_BY_ADDRESS:
-                        model_class = GetFunctionAssemblyByAddress
-                    elif tool_enum == IDATools.GET_FUNCTION_DECOMPILED_BY_NAME:
-                        model_class = GetFunctionDecompiledByName
-                    elif tool_enum == IDATools.GET_FUNCTION_DECOMPILED_BY_ADDRESS:
-                        model_class = GetFunctionDecompiledByAddress
-                    elif tool_enum == IDATools.GET_GLOBAL_VARIABLE_BY_NAME:
-                        model_class = GetGlobalVariableByName
-                    elif tool_enum == IDATools.GET_GLOBAL_VARIABLE_BY_ADDRESS:
-                        model_class = GetGlobalVariableByAddress
-                    elif tool_enum == IDATools.GET_CURRENT_FUNCTION_ASSEMBLY:
-                        model_class = GetCurrentFunctionAssembly
-                    elif tool_enum == IDATools.GET_CURRENT_FUNCTION_DECOMPILED:
-                        model_class = GetCurrentFunctionDecompiled
-                    elif tool_enum == IDATools.RENAME_LOCAL_VARIABLE:
-                        model_class = RenameLocalVariable
-                    elif tool_enum == IDATools.RENAME_GLOBAL_VARIABLE:
-                        model_class = RenameGlobalVariable
-                    elif tool_enum == IDATools.RENAME_FUNCTION:
-                        model_class = RenameFunction
-                    elif tool_enum == IDATools.RENAME_MULTI_LOCAL_VARIABLES:
-                        model_class = RenameMultiLocalVariables
-                    elif tool_enum == IDATools.RENAME_MULTI_GLOBAL_VARIABLES:
-                        model_class = RenameMultiGlobalVariables
-                    elif tool_enum == IDATools.RENAME_MULTI_FUNCTIONS:
-                        model_class = RenameMultiFunctions
-                    elif tool_enum == IDATools.ADD_ASSEMBLY_COMMENT:
-                        model_class = AddAssemblyComment
-                    elif tool_enum == IDATools.ADD_FUNCTION_COMMENT:
-                        model_class = AddFunctionComment
-                    elif tool_enum == IDATools.ADD_PSEUDOCODE_COMMENT:
-                        model_class = AddPseudocodeComment
-                    elif tool_enum == IDATools.EXECUTE_SCRIPT:
-                        model_class = ExecuteScript
-                    elif tool_enum == IDATools.EXECUTE_SCRIPT_FROM_FILE:
-                        model_class = ExecuteScriptFromFile
-                    
-                    # 如果找到了模型类，创建工具定义
-                    if model_class:
-                        # 获取工具描述
-                        description = f"IDA Pro tool: {tool_name.replace('_', ' ')}"
-                        
-                        # 获取输入模式
-                        try:
-                            input_schema = model_class.schema()
-                            
-                            # 创建工具定义
-                            tool_def = {
-                                "name": tool_enum.value,
-                                "description": description,
-                                "inputSchema": input_schema
-                            }
-                            
-                            # 验证工具定义是可序列化的
-                            json.dumps(tool_def)
-                            
-                            # 添加到列表
-                            tool_definitions.append(tool_def)
-                            
-                        except Exception as e:
-                            log_error(f"Error getting schema for {tool_enum.name}: {str(e)}")
-                            continue
-            
-            log_info(f"Returning {len(tool_definitions)} tools")
             return tool_definitions
             
         except Exception as e:
@@ -1179,7 +844,7 @@ class IDAMCPPlugin(idaapi.plugin_t):
     def __init__(self):
         super(IDAMCPPlugin, self).__init__()
         self.core: Optional[IDAMCPCore] = None
-        self.service_registry: Optional[ServiceRegistry] = None
+        self.tool_executor: Optional[ToolExecutor] = None  # Use ToolExecutor instead of ServiceRegistry
         self.server: Optional[SocketServer] = None
         self.initialized: bool = False
         self.menu_items_added: bool = False
@@ -1194,11 +859,14 @@ class IDAMCPPlugin(idaapi.plugin_t):
             # Create core instance
             self.core = IDAMCPCore()
             
-            # Create service registry
-            self.service_registry = ServiceRegistry(self.core)
+            # Register all core methods decorated with @ida_tool
+            register_core_tools(self.core)
             
-            # Create server with service registry
-            self.server = SocketServer(service_registry=self.service_registry)
+            # Create tool executor (replacing service registry)
+            self.tool_executor = ToolExecutor(self.core)
+            
+            # Create server with tool executor
+            self.server = SocketServer(tool_executor=self.tool_executor)
             
             # Add menu items
             if not self.menu_items_added:
@@ -1211,7 +879,7 @@ class IDAMCPPlugin(idaapi.plugin_t):
             log_info("Plugin initialized successfully")
             
             # Log available tools
-            tools = self.service_registry.get_all_tools()
+            tools = self.tool_executor.get_tool_names()
             log_info(f"Available tools: {', '.join(tools)}")
             
             # Delay server start to avoid initialization issues
@@ -1311,7 +979,7 @@ class IDAMCPPlugin(idaapi.plugin_t):
         
         try:
             if not self.server:
-                self.server = SocketServer(service_registry=self.service_registry)
+                self.server = SocketServer(tool_executor=self.tool_executor)
                 
             log_info("Starting MCP Server...")
             if self.server.start():
@@ -1384,3 +1052,87 @@ class IDAMCPPlugin(idaapi.plugin_t):
 # Register plugin
 def PLUGIN_ENTRY() -> IDAMCPPlugin:
     return IDAMCPPlugin()
+
+# -------------------------------------------------------------------
+# Example Tool Functions using the decorator-based approach
+# -------------------------------------------------------------------
+
+@ida_tool(description="Get assembly code for a function by its name")
+def get_function_assembly_by_name(function_name: str) -> Dict[str, Any]:
+    """Get assembly code for a function by its name"""
+    core = IDAMCPCore()
+    result = core.get_function_assembly_by_name(function_name)
+    
+    if "error" in result:
+        return ResponseFormatter.format_error_response(result["error"])
+    return ResponseFormatter.format_assembly_response(function_name, result.get("assembly", ""))
+
+@ida_tool(description="Get assembly code for a function by its address")
+def get_function_assembly_by_address(address: str) -> Dict[str, Any]:
+    """Get assembly code for a function by its address"""
+    core = IDAMCPCore()
+    
+    # Convert string address to int
+    try:
+        addr_int = int(address, 16) if isinstance(address, str) and address.startswith("0x") else int(address)
+    except ValueError:
+        return ResponseFormatter.format_error_response(f"Invalid address format '{address}', expected hexadecimal (0x...) or decimal")
+    
+    result = core.get_function_assembly_by_address(addr_int)
+    
+    if "error" in result:
+        return ResponseFormatter.format_error_response(result["error"])
+    return ResponseFormatter.format_assembly_response(result.get("function_name", "Unknown"), result.get("assembly", ""))
+
+@ida_tool(description="Rename a function")
+def rename_function(old_name: str, new_name: str) -> Dict[str, Any]:
+    """Rename a function"""
+    core = IDAMCPCore()
+    
+    if not old_name:
+        return ResponseFormatter.format_error_response("Old function name not provided")
+    if not new_name:
+        return ResponseFormatter.format_error_response("New function name not provided")
+    
+    result = core.rename_function(old_name, new_name)
+    
+    return ResponseFormatter.format_rename_response(
+        result.get("success", False),
+        result.get("message", ""),
+        "rename_function"
+    )
+
+@ida_tool(description="Add a comment to assembly code at the specified address")
+def add_assembly_comment(address: str, comment: str, is_repeatable: bool = False) -> Dict[str, Any]:
+    """Add a comment to assembly code at the specified address"""
+    core = IDAMCPCore()
+    
+    if not address:
+        return ResponseFormatter.format_error_response("Address not provided")
+    if not comment:
+        return ResponseFormatter.format_error_response("Comment not provided")
+    
+    result = core.add_assembly_comment(address, comment, is_repeatable)
+    
+    return ResponseFormatter.format_comment_response(
+        result.get("success", False),
+        result.get("message", ""),
+        "add_assembly_comment"
+    )
+
+@ida_tool(description="Execute a Python script in IDA Pro")
+def execute_script(script: str) -> Dict[str, Any]:
+    """Execute a Python script in IDA Pro"""
+    core = IDAMCPCore()
+    
+    if not script:
+        return ResponseFormatter.format_error_response("Script not provided")
+    
+    result = core.execute_script(script)
+    
+    return ResponseFormatter.format_script_response(
+        result.get("success", False),
+        result.get("message", ""),
+        result.get("stdout", ""),
+        result.get("stderr", "")
+    )
