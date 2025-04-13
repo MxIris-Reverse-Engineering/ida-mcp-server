@@ -12,6 +12,7 @@ from ida_mcp_server_plugin.ida_mcp_core import IDAMCPCore
 from pydantic import BaseModel
 from enum import Enum
 import functools
+import inspect
 
 PLUGIN_NAME = "IDA MCP Server"
 PLUGIN_HOTKEY = "Ctrl-Alt-M"
@@ -80,149 +81,156 @@ def ida_tool(tool_name: Optional[str] = None, description: Optional[str] = None)
 def get_ida_tool_decorator():
     return ida_tool
 
-# Function to automatically scan and register core methods
-def register_core_tools(core: IDAMCPCore) -> None:
-    """
-    Scans IDAMCPCore instance and registers all methods decorated with @ida_tool
+# Define create_bound_wrapper function once at module level
+def create_bound_wrapper(instance, meth):
+    # Create a closure over the bound method
+    bound_method = meth.__get__(instance, instance.__class__)
     
-    Args:
-        core: The IDAMCPCore instance
-    """
-    core_methods = dir(core)
+    # Create a wrapper that forwards all kwargs to the bound method
+    def wrapper(**kwargs):
+        try:
+            log_debug(f"Calling bound method {meth.__name__} with kwargs: {kwargs}")
+            # Debugging to verify parameters
+            method_sig = inspect.signature(meth)
+            log_debug(f"Actual method signature: {method_sig}")
+            
+            # Validate parameters against method signature
+            expected_params = [p for p in method_sig.parameters if p != 'self']
+            log_debug(f"Expected parameters: {expected_params}")
+            log_debug(f"Received parameters: {list(kwargs.keys())}")
+            
+            # Check and log any missing parameters
+            missing = [p for p in expected_params if p not in kwargs]
+            if missing:
+                log_error(f"Missing required parameters: {missing}")
+                return {"success": False, "error": f"Missing required parameters: {', '.join(missing)}"}
+            
+            # Call the bound method with the parameters
+            result = bound_method(**kwargs)
+            log_debug(f"Bound method call successful")
+            return result
+        except Exception as e:
+            log_error(f"Error in bound method {meth.__name__}: {str(e)}")
+            traceback.print_exc()
+            return {"success": False, "error": str(e)}
+    return wrapper
+
+def register_tools(core: Any) -> None:
+    """Register all core methods as tools"""
+    log_info("Registering IDA Pro core tools...")
+    registered_count = 0
     
-    for tool_name, metadata in list(_tool_metadata.items()):
+    # 从core实例获取所有可调用方法
+    core_members = [m for m in dir(core) if not m.startswith('__')]
+    core_methods = [m for m in core_members if callable(getattr(core, m))]
+    
+    # 第一步：查找并注册元数据中定义的方法（旧方式）
+    for tool_name, metadata in _tool_metadata.items():
+        # Skip if the tool is already registered
+        if tool_name in _tool_registry:
+            log_debug(f"Tool {tool_name} already registered, skipping")
+            continue
+            
+        # 从元数据中找到对应的core方法名
         method_name = metadata.get("core_method")
         
-        # If this is a core method and it exists in the core instance
         if method_name and method_name in core_methods:
-            # Create a wrapper function that will call the core method
-            def create_wrapper(method_name):
-                def wrapper(**kwargs):
-                    # Get the method from the core instance
-                    method = getattr(core, method_name)
-                    # Call it with the given parameters
-                    return method(**kwargs)
-                return wrapper
+            # Get the method itself
+            original_method = getattr(core, method_name)
             
-            # Register the wrapper function
-            wrapper = create_wrapper(method_name)
+            # Use the global create_bound_wrapper function
+            
+            # Register the wrapper function with a reference to the core instance
+            wrapper = create_bound_wrapper(core, original_method)
             wrapper.__name__ = method_name
             wrapper.__doc__ = metadata.get("description")
             
             # Replace the original registration with the wrapper
             _tool_registry[tool_name] = wrapper
             log_info(f"Registered core method {method_name} as tool {tool_name}")
+            registered_count += 1
+
+    # 第二步：查找并注册所有带有__ida_tool__标记的方法（新方式）
+    already_registered = set()
+    for item in _tool_metadata.values():
+        if "core_method" in item:
+            already_registered.add(item["core_method"])
+    
+    for method_name in core_methods:
+        # 跳过已注册和私有方法
+        if method_name.startswith('_') or method_name in already_registered:
+            continue
+        
+        try:
+            method = getattr(core, method_name)
+            # 检查方法是否有__ida_tool__标记
+            if callable(method) and hasattr(method, "__ida_tool__") and getattr(method, "__ida_tool__"):
+                # 获取tool_name，如果方法有自定义名称则使用，否则使用默认前缀形式
+                custom_tool_name = getattr(method, "__ida_tool_name__", None)
+                tool_name = custom_tool_name if custom_tool_name else f"ida_{method_name}"
+                
+                # 获取描述
+                description = getattr(method, "__ida_tool_description__", None) or method.__doc__ or f"IDA Pro tool: {method_name.replace('_', ' ')}"
+                
+                # 创建包装函数 - 使用绑定方法
+                # Get the method itself - for clarity we obtain it again
+                original_method = getattr(core, method_name)
+                
+                # Use the global create_bound_wrapper function
+                wrapper = create_bound_wrapper(core, original_method)
+                wrapper.__name__ = method_name
+                wrapper.__doc__ = description
+                
+                # 添加到工具注册表
+                _tool_registry[tool_name] = wrapper
+                
+                # 添加到元数据
+                _tool_metadata[tool_name] = {
+                    "name": tool_name,
+                    "description": description,
+                    "function": method,
+                    "core_method": method_name
+                }
+                
+                log_info(f"Registered marked method {method_name} as tool {tool_name}")
+                registered_count += 1
+        except Exception as e:
+            log_error(f"Error registering method {method_name}: {str(e)}")
+            traceback.print_exc()
+    
+    log_info(f"Total registered tools: {registered_count}")
+
+    # 补充：如果注册工具数量为0，这是一个明显的问题
+    if registered_count == 0:
+        log_error("No tools were registered! This is likely an error with the decorator mechanism.")
+        
+        # 尝试列出所有可能的工具方法进行诊断
+        potential_tools = []
+        for method_name in core_methods:
+            if not method_name.startswith('_'):
+                try:
+                    method = getattr(core, method_name)
+                    if callable(method):
+                        attrs = []
+                        if hasattr(method, "__ida_tool__"):
+                            attrs.append("__ida_tool__=" + str(getattr(method, "__ida_tool__")))
+                        if hasattr(method, "__ida_tool_description__"):
+                            attrs.append("has __ida_tool_description__")
+                        if hasattr(method, "__ida_tool_name__"):
+                            attrs.append("has __ida_tool_name__")
+                            
+                        potential_tools.append(f"{method_name} [{', '.join(attrs)}]")
+                except:
+                    pass
+                    
+        if potential_tools:
+            log_info(f"Potential tool methods found (but not registered): {', '.join(potential_tools)}")
+        else:
+            log_info("No potential tool methods found with any __ida_tool__ attributes")
 
 # -------------------------------------------------------------------
 # Tool Request Models
 # -------------------------------------------------------------------
-
-class GetFunctionAssemblyByName(BaseModel):
-    function_name: str
-
-class GetFunctionAssemblyByAddress(BaseModel):
-    address: str  # Hexadecimal address as string
-
-class GetFunctionDecompiledByName(BaseModel):
-    function_name: str
-
-class GetFunctionDecompiledByAddress(BaseModel):
-    address: str  # Hexadecimal address as string
-
-class GetGlobalVariableByName(BaseModel):
-    variable_name: str
-
-class GetGlobalVariableByAddress(BaseModel):
-    address: str  # Hexadecimal address as string
-
-class GetCurrentFunctionAssembly(BaseModel):
-    pass
-
-class GetCurrentFunctionDecompiled(BaseModel):
-    pass
-
-class RenameLocalVariable(BaseModel):
-    function_name: str
-    old_name: str
-    new_name: str
-
-class RenameGlobalVariable(BaseModel):
-    old_name: str
-    new_name: str
-
-class RenameFunction(BaseModel):
-    old_name: str
-    new_name: str
-
-class RenameMultiLocalVariables(BaseModel):
-    function_name: str
-    rename_pairs_old2new: List[Dict[str, str]]  # List of dictionaries with "old_name" and "new_name" keys
-
-class RenameMultiGlobalVariables(BaseModel):
-    rename_pairs_old2new: List[Dict[str, str]]
-
-class RenameMultiFunctions(BaseModel):
-    rename_pairs_old2new: List[Dict[str, str]]
-
-class AddAssemblyComment(BaseModel):
-    address: str  # Can be a hexadecimal address string
-    comment: str
-    is_repeatable: bool = False  # Whether the comment should be repeatable
-
-class AddFunctionComment(BaseModel):
-    function_name: str
-    comment: str
-    is_repeatable: bool = False  # Whether the comment should be repeatable
-
-class AddPseudocodeComment(BaseModel):
-    function_name: str
-    address: str  # Address in the pseudocode
-    comment: str
-    is_repeatable: bool = False  # Whether comment should be repeated at all occurrences
-
-class ExecuteScript(BaseModel):
-    script: str
-
-class ExecuteScriptFromFile(BaseModel):
-    file_path: str
-
-class MCPToolDefinition:
-    """Represents a tool definition that can be sent to the MCP server"""
-    
-    def __init__(self, name: str, description: str, input_schema: Dict[str, Any]):
-        self.name = name
-        self.description = description
-        self.input_schema = input_schema
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary format"""
-        return {
-            "name": self.name,
-            "description": self.description,
-            "inputSchema": self.input_schema
-        }
-
-class IDATools(str, Enum):
-    """Enum of available IDA tools to be exposed to MCP"""
-    GET_FUNCTION_ASSEMBLY_BY_NAME = "ida_get_function_assembly_by_name"
-    GET_FUNCTION_ASSEMBLY_BY_ADDRESS = "ida_get_function_assembly_by_address"
-    GET_FUNCTION_DECOMPILED_BY_NAME = "ida_get_function_decompiled_by_name"
-    GET_FUNCTION_DECOMPILED_BY_ADDRESS = "ida_get_function_decompiled_by_address"
-    GET_GLOBAL_VARIABLE_BY_NAME = "ida_get_global_variable_by_name"
-    GET_GLOBAL_VARIABLE_BY_ADDRESS = "ida_get_global_variable_by_address"
-    GET_CURRENT_FUNCTION_ASSEMBLY = "ida_get_current_function_assembly"
-    GET_CURRENT_FUNCTION_DECOMPILED = "ida_get_current_function_decompiled"
-    RENAME_LOCAL_VARIABLE = "ida_rename_local_variable"
-    RENAME_GLOBAL_VARIABLE = "ida_rename_global_variable"
-    RENAME_FUNCTION = "ida_rename_function"
-    RENAME_MULTI_LOCAL_VARIABLES = "ida_rename_multi_local_variables"
-    RENAME_MULTI_GLOBAL_VARIABLES = "ida_rename_multi_global_variables"
-    RENAME_MULTI_FUNCTIONS = "ida_rename_multi_functions"
-    ADD_ASSEMBLY_COMMENT = "ida_add_assembly_comment"
-    ADD_FUNCTION_COMMENT = "ida_add_function_comment"
-    ADD_PSEUDOCODE_COMMENT = "ida_add_pseudocode_comment"
-    EXECUTE_SCRIPT = "ida_execute_script"
-    EXECUTE_SCRIPT_FROM_FILE = "ida_execute_script_from_file"
 
 # Setup basic logging
 def log_info(message: str) -> None:
@@ -347,38 +355,152 @@ class ToolExecutor:
             if full_tool_name in _tool_registry:
                 func = _tool_registry[full_tool_name]
                 
+                log_info(f"Found registered tool {full_tool_name}: {func.__name__}")
+                
                 # Get the function's type hints
                 type_hints = get_type_hints(func)
                 
                 # Remove return annotation if present
                 type_hints.pop("return", None)
                 
+                log_debug(f"Tool {full_tool_name} expects parameters: {', '.join(type_hints.keys())}")
+                log_debug(f"Received parameters: {', '.join(data.keys())}")
+                
                 # Convert and validate parameters
                 kwargs = {}
+                log_debug(f"Data dictionary contains: {data}")
+
+                try:
+                    # Get method signature directly to see all expected parameters
+                    original_method = None
+                    method_sig = None
+                    if full_tool_name in _tool_metadata:
+                        core_method_name = _tool_metadata[full_tool_name].get("core_method")
+                        if core_method_name:
+                            original_method = getattr(self.core, core_method_name, None)
+                    
+                    if original_method:
+                        method_sig = inspect.signature(original_method)
+                        expected_params = [p for p in method_sig.parameters if p != 'self']
+                        log_debug(f"Original method signature: {method_sig}")
+                        log_debug(f"Expected parameters from method signature: {expected_params}")
+                    else:
+                        # Fallback: inspect the wrapper function if original not found (less reliable)
+                        method_sig = inspect.signature(func)
+                        log_warning(f"Could not find original method, using wrapper signature: {method_sig}")
+
+                    # For each parameter in the determined method signature
+                    for param_name, param_details in method_sig.parameters.items():
+                        if param_name == 'self':  # Skip self if it's a method
+                            continue
+
+                        log_debug(f"Processing parameter '{param_name}' (expected type: {param_details.annotation})")
+                        
+                        expected_type = param_details.annotation if param_details.annotation != inspect.Parameter.empty else Any
+                        
+                        # Find the parameter value in the input data (case-insensitive check included)
+                        value = None
+                        found_in_data = False
+                        if param_name in data:
+                            value = data[param_name]
+                            found_in_data = True
+                            log_debug(f"Found parameter in data: '{param_name}' = {value} (type: {type(value).__name__})")
+                        else:
+                             # Case-insensitive fallback
+                            for data_key in data:
+                                if data_key.lower() == param_name.lower():
+                                    value = data[data_key]
+                                    found_in_data = True
+                                    log_warning(f"Found parameter with different case: '{data_key}' used for '{param_name}'")
+                                    break
+                        
+                        if found_in_data:
+                             # Try to convert to expected type if needed
+                            if expected_type != Any:
+                                if expected_type == int and isinstance(value, str):
+                                    # Special handling for addresses and integers
+                                    try:
+                                        if value.startswith("0x"):
+                                            value = int(value, 16)
+                                            log_debug(f"Converted hex string to int: {value}")
+                                        else:
+                                            # Check if it might be a hex without 0x prefix
+                                            if any(c in "abcdefABCDEF" for c in value):
+                                                value = int(value, 16)
+                                                log_debug(f"Converted implied hex string to int: {value}")
+                                            else:
+                                                value = int(value)
+                                                log_debug(f"Converted decimal string to int: {value}")
+                                    except ValueError as ve:
+                                        error_msg = f"Invalid value for '{param_name}': '{value}' - {str(ve)}"
+                                        log_error(error_msg)
+                                        return ResponseFormatter.format_error_response(error_msg)
+                                elif not isinstance(value, expected_type):
+                                    try:
+                                        # Handle bool conversion specifically
+                                        if expected_type == bool and isinstance(value, str):
+                                            value = value.lower() in ['true', '1', 't', 'y', 'yes']
+                                        else:
+                                            value = expected_type(value)
+                                        log_debug(f"Converted {type(value).__name__} to {expected_type.__name__}")
+                                    except (ValueError, TypeError) as e:
+                                        error_msg = f"Invalid type for parameter '{param_name}': expected {expected_type.__name__}, got {type(value).__name__} - {str(e)}"
+                                        log_error(error_msg)
+                                        return ResponseFormatter.format_error_response(error_msg)
+                            
+                            kwargs[param_name] = value
+                            log_debug(f"Set parameter '{param_name}' to {value}")
+                        elif param_details.default is not inspect.Parameter.empty:
+                            # Use default value if parameter not found in data
+                            log_debug(f"Using default value for optional parameter '{param_name}'")
+                            kwargs[param_name] = param_details.default # Add default value to kwargs
+                        else:
+                            # If parameter is required but not found and has no default
+                            error_msg = f"Missing required parameter '{param_name}' for tool {full_tool_name}"
+                            log_error(error_msg)
+                            return ResponseFormatter.format_error_response(error_msg)
+                except Exception as param_error:
+                    log_error(f"Error processing parameters: {str(param_error)}")
+                    traceback.print_exc()
+                    return ResponseFormatter.format_error_response(f"Error processing parameters: {str(param_error)}")
+
+                # Double check that all required parameters are present (redundant now, but safe)
+                required_params_missing = []
+                if method_sig:
+                    for param_name, param_details in method_sig.parameters.items():
+                        if param_name != 'self' and param_details.default is inspect.Parameter.empty and param_name not in kwargs:
+                            required_params_missing.append(param_name)
                 
-                # For each parameter in the function signature
-                for param_name, expected_type in type_hints.items():
-                    if param_name in data:
-                        value = data[param_name]
-                        # Try to convert to expected type if needed
-                        if not isinstance(value, expected_type) and expected_type != Any:
-                            try:
-                                # Handle special case for addresses
-                                if param_name == "address" and isinstance(value, str):
-                                    if value.startswith("0x"):
-                                        value = int(value, 16)
-                                    else:
-                                        value = int(value)
-                                else:
-                                    value = expected_type(value)
-                            except (ValueError, TypeError):
-                                return ResponseFormatter.format_error_response(
-                                    f"Invalid type for parameter '{param_name}': expected {expected_type.__name__}"
-                                )
-                        kwargs[param_name] = value
-                
+                if required_params_missing:
+                    error_msg = f"Internal check failed: Missing required parameters after processing: {', '.join(required_params_missing)}"
+                    log_error(error_msg)
+                    return ResponseFormatter.format_error_response(error_msg)
+
                 # Call the function with the prepared parameters
-                result = func(**kwargs)
+                log_info(f"Calling {full_tool_name} with parameters: {', '.join([f'{k}={v}' for k, v in kwargs.items()])}") # Log should now show parameters
+                try:
+                    log_debug(f"Function object: {func.__name__}, callable: {callable(func)}")
+                    
+                    # Inspect the function signature
+                    try:
+                        sig = inspect.signature(func)
+                        log_debug(f"Function signature: {sig}")
+                        
+                        # Check if the function has a 'self' parameter
+                        params = list(sig.parameters.keys())
+                        has_self = len(params) > 0 and params[0] == 'self'
+                        log_debug(f"Function has 'self' parameter: {has_self}")
+                    except Exception as sig_error:
+                        log_warning(f"Could not inspect function signature: {str(sig_error)}")
+                    
+                    # Call the function
+                    result = func(**kwargs)
+                    log_debug(f"Function call successful, result type: {type(result).__name__}")
+                except Exception as call_error:
+                    error_msg = f"Error calling {full_tool_name}: {str(call_error)}"
+                    log_error(error_msg)
+                    traceback.print_exc()
+                    return ResponseFormatter.format_error_response(error_msg)
                 
                 # Ensure the result is a dict with at least success field
                 if not isinstance(result, dict):
@@ -386,17 +508,122 @@ class ToolExecutor:
                 if "success" not in result:
                     result["success"] = True
                     
+                log_info(f"Tool {full_tool_name} executed successfully: {result.get('success', True)}")
                 return result
             else:
                 # Try to use core methods directly if no registered tool found
                 # This provides backward compatibility with the old system
                 method_name = base_tool_name
                 if hasattr(self.core, method_name) and callable(getattr(self.core, method_name)):
+                    log_info(f"No registered tool found for {full_tool_name}, attempting direct core method call")
                     method = getattr(self.core, method_name)
-                    result = method(**data)
-                    return result
+                    
+                    # Check if the method has the __ida_tool__ attribute
+                    has_tool_attr = hasattr(method, "__ida_tool__") and getattr(method, "__ida_tool__")
+                    log_debug(f"Direct method {method_name} has __ida_tool__ attribute: {has_tool_attr}")
+                    
+                    # Call the method directly
+                    try:
+                        log_debug(f"Direct call to method {method_name}, callable: {callable(method)}")
+                        
+                        # Inspect the method signature
+                        try:
+                            sig = inspect.signature(method)
+                            log_debug(f"Method signature: {sig}")
+                            
+                            # Check if the method has a 'self' parameter
+                            params = list(sig.parameters.keys())
+                            has_self = len(params) > 0 and params[0] == 'self'
+                            log_debug(f"Method has 'self' parameter: {has_self}")
+                            
+                            # Process parameters for the direct call
+                            kwargs = {}
+                            for param_name, param in sig.parameters.items():
+                                if param_name == 'self':
+                                    continue  # Skip self parameter
+                                    
+                                # Check if parameter is in the data dictionary
+                                if param_name in data:
+                                    value = data[param_name]
+                                    log_debug(f"Found parameter in data: '{param_name}' = {value}")
+                                    
+                                    # Try to convert the parameter if needed
+                                    param_type = param.annotation if param.annotation != inspect.Parameter.empty else None
+                                    if param_type is not None and param_type != Any:
+                                        if param_type == int and isinstance(value, str):
+                                            # Special handling for addresses and integers
+                                            try:
+                                                if value.startswith("0x"):
+                                                    value = int(value, 16)
+                                                    log_debug(f"Converted hex string to int: '{value}'")
+                                                else:
+                                                    # Check if it might be a hex without 0x prefix
+                                                    if any(c in "abcdefABCDEF" for c in value):
+                                                        value = int(value, 16)
+                                                        log_debug(f"Converted implied hex string to int: '{value}'")
+                                                    else:
+                                                        value = int(value)
+                                                        log_debug(f"Converted decimal string to int: '{value}'")
+                                            except ValueError as ve:
+                                                return ResponseFormatter.format_error_response(
+                                                    f"Invalid value for '{param_name}': '{value}' - {str(ve)}"
+                                                )
+                                        elif not isinstance(value, param_type):
+                                            try:
+                                                value = param_type(value)
+                                                log_debug(f"Converted {type(value).__name__} to {param_type.__name__}")
+                                            except (ValueError, TypeError) as e:
+                                                return ResponseFormatter.format_error_response(
+                                                    f"Invalid type for parameter '{param_name}': expected {param_type.__name__}, got {type(value).__name__} - {str(e)}"
+                                                )
+                                    
+                                    kwargs[param_name] = value
+                                else:
+                                    # Check for case-insensitive match
+                                    found = False
+                                    for data_key in data:
+                                        if data_key.lower() == param_name.lower():
+                                            value = data[data_key]
+                                            log_debug(f"Found parameter with different case: '{data_key}' = {value}")
+                                            kwargs[param_name] = value
+                                            found = True
+                                            break
+                                    
+                                    # Check if parameter has a default value
+                                    if not found and param.default != inspect.Parameter.empty:
+                                        log_debug(f"Using default value for optional parameter '{param_name}'")
+                                        continue
+                                    elif not found:
+                                        missing_param = param_name
+                                        log_error(f"Missing required parameter for direct method call: {missing_param}")
+                                        return ResponseFormatter.format_error_response(
+                                            f"Missing required parameter: {missing_param}"
+                                        )
+                            
+                            # Log what we're going to call with
+                            log_debug(f"Calling direct method with kwargs: {kwargs}")
+                            
+                            # Create a bound method to ensure 'self' is properly passed
+                            bound_method = method.__get__(self.core, self.core.__class__)
+                            result = bound_method(**kwargs)
+                            log_info(f"Direct call to {method_name} successful")
+                            return result
+                        except Exception as sig_error:
+                            log_warning(f"Could not inspect method signature: {str(sig_error)}")
+                            # Fall back to using the original data dictionary
+                            bound_method = method.__get__(self.core, self.core.__class__)
+                            result = bound_method(**data)
+                            log_info(f"Direct call to {method_name} successful (using fallback)")
+                            return result
+                    except Exception as direct_error:
+                        error_msg = f"Error in direct call to {method_name}: {str(direct_error)}"
+                        log_error(error_msg)
+                        traceback.print_exc()
+                        return ResponseFormatter.format_error_response(error_msg)
                 
-                log_warning(f"No tool found for {full_tool_name}")
+                # Log available tools for debugging
+                available_tools = list(_tool_registry.keys())
+                log_warning(f"No tool found for {full_tool_name}. Available tools: {', '.join(available_tools)}")
                 return ResponseFormatter.format_error_response(f"Tool not found: {full_tool_name}")
                 
         except Exception as e:
@@ -858,9 +1085,28 @@ class IDAMCPPlugin(idaapi.plugin_t):
             
             # Create core instance
             self.core = IDAMCPCore()
+            log_info(f"Created IDAMCPCore instance: {self.core.__class__.__name__}")
+            
+            # Log available methods in core
+            methods = [m for m in dir(self.core) if callable(getattr(self.core, m)) and not m.startswith('_')]
+            log_info(f"Core has {len(methods)} public methods")
+            log_debug(f"Core methods: {', '.join(methods)}")
+            
+            # Check for any methods with ida_tool attributes
+            tool_methods = []
+            for method_name in methods:
+                method = getattr(self.core, method_name)
+                if hasattr(method, "__ida_tool__") and getattr(method, "__ida_tool__"):
+                    tool_methods.append(method_name)
+            
+            if tool_methods:
+                log_info(f"Found {len(tool_methods)} methods with __ida_tool__ attribute: {', '.join(tool_methods)}")
+            else:
+                log_warning("No methods with __ida_tool__ attribute found before registration")
             
             # Register all core methods decorated with @ida_tool
-            register_core_tools(self.core)
+            log_info("Registering core tools...")
+            register_tools(self.core)
             
             # Create tool executor (replacing service registry)
             self.tool_executor = ToolExecutor(self.core)
@@ -880,7 +1126,10 @@ class IDAMCPPlugin(idaapi.plugin_t):
             
             # Log available tools
             tools = self.tool_executor.get_tool_names()
-            log_info(f"Available tools: {', '.join(tools)}")
+            if tools:
+                log_info(f"Available tools ({len(tools)}): {', '.join(tools)}")
+            else:
+                log_error("No tools were registered during initialization!")
             
             # Delay server start to avoid initialization issues
             idaapi.register_timer(500, self._delayed_server_start)
@@ -1052,87 +1301,3 @@ class IDAMCPPlugin(idaapi.plugin_t):
 # Register plugin
 def PLUGIN_ENTRY() -> IDAMCPPlugin:
     return IDAMCPPlugin()
-
-# -------------------------------------------------------------------
-# Example Tool Functions using the decorator-based approach
-# -------------------------------------------------------------------
-
-@ida_tool(description="Get assembly code for a function by its name")
-def get_function_assembly_by_name(function_name: str) -> Dict[str, Any]:
-    """Get assembly code for a function by its name"""
-    core = IDAMCPCore()
-    result = core.get_function_assembly_by_name(function_name)
-    
-    if "error" in result:
-        return ResponseFormatter.format_error_response(result["error"])
-    return ResponseFormatter.format_assembly_response(function_name, result.get("assembly", ""))
-
-@ida_tool(description="Get assembly code for a function by its address")
-def get_function_assembly_by_address(address: str) -> Dict[str, Any]:
-    """Get assembly code for a function by its address"""
-    core = IDAMCPCore()
-    
-    # Convert string address to int
-    try:
-        addr_int = int(address, 16) if isinstance(address, str) and address.startswith("0x") else int(address)
-    except ValueError:
-        return ResponseFormatter.format_error_response(f"Invalid address format '{address}', expected hexadecimal (0x...) or decimal")
-    
-    result = core.get_function_assembly_by_address(addr_int)
-    
-    if "error" in result:
-        return ResponseFormatter.format_error_response(result["error"])
-    return ResponseFormatter.format_assembly_response(result.get("function_name", "Unknown"), result.get("assembly", ""))
-
-@ida_tool(description="Rename a function")
-def rename_function(old_name: str, new_name: str) -> Dict[str, Any]:
-    """Rename a function"""
-    core = IDAMCPCore()
-    
-    if not old_name:
-        return ResponseFormatter.format_error_response("Old function name not provided")
-    if not new_name:
-        return ResponseFormatter.format_error_response("New function name not provided")
-    
-    result = core.rename_function(old_name, new_name)
-    
-    return ResponseFormatter.format_rename_response(
-        result.get("success", False),
-        result.get("message", ""),
-        "rename_function"
-    )
-
-@ida_tool(description="Add a comment to assembly code at the specified address")
-def add_assembly_comment(address: str, comment: str, is_repeatable: bool = False) -> Dict[str, Any]:
-    """Add a comment to assembly code at the specified address"""
-    core = IDAMCPCore()
-    
-    if not address:
-        return ResponseFormatter.format_error_response("Address not provided")
-    if not comment:
-        return ResponseFormatter.format_error_response("Comment not provided")
-    
-    result = core.add_assembly_comment(address, comment, is_repeatable)
-    
-    return ResponseFormatter.format_comment_response(
-        result.get("success", False),
-        result.get("message", ""),
-        "add_assembly_comment"
-    )
-
-@ida_tool(description="Execute a Python script in IDA Pro")
-def execute_script(script: str) -> Dict[str, Any]:
-    """Execute a Python script in IDA Pro"""
-    core = IDAMCPCore()
-    
-    if not script:
-        return ResponseFormatter.format_error_response("Script not provided")
-    
-    result = core.execute_script(script)
-    
-    return ResponseFormatter.format_script_response(
-        result.get("success", False),
-        result.get("message", ""),
-        result.get("stdout", ""),
-        result.get("stderr", "")
-    )
