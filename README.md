@@ -1,4 +1,5 @@
 # IDA MCP Server
+[![smithery badge](https://smithery.ai/badge/@MxIris-Reverse-Engineering/ida-mcp-server)](https://smithery.ai/server/@MxIris-Reverse-Engineering/ida-mcp-server)
 
 > [!NOTE]
 > The idalib mode is under development, and it will not require installing the IDA plugin or running IDA (idalib is available from IDA Pro 9.0+).
@@ -10,6 +11,14 @@ A Model Context Protocol server for IDA interaction and automation. This server 
 Please note that mcp-server-ida is currently in early development. The functionality and available tools are subject to change and expansion as we continue to develop and improve the server.
 
 ## Installation
+
+### Installing via Smithery
+
+To install IDA MCP Server for Claude Desktop automatically via [Smithery](https://smithery.ai/server/@MxIris-Reverse-Engineering/ida-mcp-server):
+
+```bash
+npx -y @smithery/cli install @MxIris-Reverse-Engineering/ida-mcp-server --client claude
+```
 
 ### Using uv (recommended)
 
